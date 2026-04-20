@@ -1,0 +1,10 @@
+BakkesModSDK/
+QueuePlugin/obj/
+QueuePlugin/build/*.exp
+QueuePlugin/build/*.ilk
+QueuePlugin/build/*.lib
+QueuePlugin/build/*.pdb
+backend/queue.db
+backend/replays/
+backend/__pycache__/
+*.user
