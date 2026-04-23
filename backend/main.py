@@ -43,7 +43,7 @@ DECLINE_MAX          = 3     # max declines before cooldown
 DECLINE_COOLDOWN_SECS = 300  # 5 min cooldown after too many declines
 
 LOBBY_CREATE_TIMEOUT = 180   # 3 min: host must click "Lobby ready" after all accept
-DRAW_TIMEOUT_SECS    = 3600  # 1 hour after lobby_ready with no result = auto-draw
+DRAW_TIMEOUT_SECS    = 1800  # 30 min after lobby_ready with no result = auto-draw
 
 PLAYERS_NEEDED = {"1s": 2, "2s": 4, "3s": 6}
 

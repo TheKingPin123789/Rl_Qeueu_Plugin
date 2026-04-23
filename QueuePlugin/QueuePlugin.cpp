@@ -707,6 +707,15 @@ void QueuePlugin::JoinQueue()
                 queueStatus = "Error: server unreachable";
                 return;
             }
+            // A non-queued response means the server rejected the join (e.g. 409
+            // "already in an active match").  Show the detail message and bail out.
+            std::string status = JsonStr(resp, "status");
+            if (status != "queued") {
+                inQueue     = false;
+                std::string detail = JsonStr(resp, "detail");
+                queueStatus = detail.empty() ? "Could not join queue." : detail;
+                return;
+            }
             int pos = SafeStoi(JsonNum(resp, "position"), 0);
             if (pos > 0) queuePosition = pos;
             StartPolling();
