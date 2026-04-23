@@ -1,0 +1,3 @@
+# Bad word blocklist — one word per line (3-20 chars, alphanumeric + underscore)
+# Leet substitutions are normalised before checking (e.g. "4ss" matches "ass")
+# Lines starting with # are comments and are ignored
