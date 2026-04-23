@@ -964,7 +964,6 @@ void QueuePlugin::SubmitOutcome(const std::string& outcome)
                 outcomeStatus = "✅ Result accepted — MMR updated!";
                 lastMatchID        = matchID;
                 lastMatchTimestamp = time(nullptr);
-                // Clear match state after a short delay so player can read the message
                 gameWrapper->SetTimeout([this](GameWrapper* gw) {
                     if (!matchFound) return;
                     CancelMatchLocally("Not in queue");
@@ -989,13 +988,116 @@ void QueuePlugin::SubmitOutcome(const std::string& outcome)
                     CancelMatchLocally("Not in queue");
                 }, 4.0f);
             } else if (s == "recorded" || s == "waiting") {
-                // Accepted, waiting for other players to submit
                 outcomeStatus = "Recorded — waiting for other players...";
             } else {
                 outcomeStatus = "Unexpected response: " + s;
             }
+
+            // Always try to auto-upload the replay for server-side verification.
+            // This runs on a background thread regardless of the result status above.
+            // If the replay verifies cleanly, the server resolves the match automatically
+            // and PollMatchStatus() will notice via status=="resolved".
+            UploadReplayForVerification();
         });
     });
+}
+
+void QueuePlugin::UploadReplayForVerification()
+{
+    if (matchID.empty()) return;
+
+    std::string mid = matchID;
+    std::string pid = playerID;
+
+    // Find the newest replay on a background thread (file I/O off the game thread)
+    std::thread([this, mid, pid]() {
+        std::string path = FindNewestReplay();
+        if (path.empty()) return;   // no replay found — skip silently
+
+        std::ifstream file(path, std::ios::binary);
+        if (!file.is_open()) return;
+        std::vector<char> data((std::istreambuf_iterator<char>(file)),
+                                std::istreambuf_iterator<char>());
+        file.close();
+
+        if (data.size() < 4096) return;   // too small to be a real replay
+
+        if (!pluginAlive) return;
+
+        // Upload to the verification endpoint
+        HINTERNET hSession = WinHttpOpen(L"QueuePlugin/1.0",
+            WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME,
+            WINHTTP_NO_PROXY_BYPASS, 0);
+        if (!hSession) return;
+
+        DWORD timeoutMs = 30000;   // 30 s — replay files are up to a few MB
+        WinHttpSetOption(hSession, WINHTTP_OPTION_CONNECT_TIMEOUT, &timeoutMs, sizeof(timeoutMs));
+        WinHttpSetOption(hSession, WINHTTP_OPTION_SEND_TIMEOUT,    &timeoutMs, sizeof(timeoutMs));
+        WinHttpSetOption(hSession, WINHTTP_OPTION_RECEIVE_TIMEOUT, &timeoutMs, sizeof(timeoutMs));
+
+        std::wstring wHost(SERVER_HOST.begin(), SERVER_HOST.end());
+        HINTERNET hConnect = WinHttpConnect(hSession, wHost.c_str(), SERVER_PORT, 0);
+        if (!hConnect) { WinHttpCloseHandle(hSession); return; }
+
+        std::wstring wPath = L"/match/upload_replay/"
+            + std::wstring(mid.begin(), mid.end())
+            + L"?player_id=" + std::wstring(pid.begin(), pid.end());
+
+        HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"POST", wPath.c_str(),
+            nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, 0);
+        if (!hRequest) {
+            WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession); return;
+        }
+
+        WinHttpSendRequest(hRequest,
+            L"Content-Type: application/octet-stream\r\n", -1,
+            (LPVOID)data.data(), (DWORD)data.size(), (DWORD)data.size(), 0);
+        WinHttpReceiveResponse(hRequest, nullptr);
+
+        // Read response
+        std::string response;
+        DWORD dwSize = 0;
+        do {
+            DWORD downloaded = 0;
+            WinHttpQueryDataAvailable(hRequest, &dwSize);
+            if (!dwSize) break;
+            std::vector<char> buf(dwSize + 1, 0);
+            WinHttpReadData(hRequest, buf.data(), dwSize, &downloaded);
+            response.append(buf.data(), downloaded);
+        } while (dwSize > 0);
+
+        WinHttpCloseHandle(hRequest);
+        WinHttpCloseHandle(hConnect);
+        WinHttpCloseHandle(hSession);
+
+        if (!pluginAlive) return;
+
+        gameWrapper->Execute([this, response, mid](GameWrapper* gw) {
+            if (!pluginAlive) return;
+            // Only update UI if we're still in this match
+            if (matchID != mid) return;
+
+            std::string status = JsonStr(response, "status");
+            if (status == "auto_resolved") {
+                // Replay was clean — server already awarded MMR.
+                // PollMatchStatus will detect this and clear state, but give instant feedback.
+                std::string score = JsonStr(response, "score");
+                outcomeStatus = "✅ Replay verified (" + score + ") — MMR updated!";
+                lastMatchID        = matchID;
+                lastMatchTimestamp = time(nullptr);
+                gameWrapper->SetTimeout([this](GameWrapper* gw) {
+                    if (!matchFound) return;
+                    CancelMatchLocally("Not in queue");
+                    FetchMMR();
+                    FetchHistory();
+                }, 3.0f);
+            } else if (status == "flagged") {
+                std::string reason = JsonStr(response, "reason");
+                outcomeStatus = "⚠ Replay flagged: " + reason;
+            }
+            // "unverifiable" and "already_resolved" — no UI change needed
+        });
+    }).detach();
 }
 
 // ── lobby ─────────────────────────────────────────────────────────────────────

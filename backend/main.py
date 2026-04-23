@@ -4,10 +4,12 @@ from pydantic import BaseModel
 import asyncio
 import random
 import string
+import struct
 import time
 import sqlite3
 import os
 import re
+from datetime import datetime, timezone
 from typing import Optional
 
 app = FastAPI()
@@ -317,6 +319,239 @@ def _get_total_players(match_id: str) -> int | None:
     ).fetchone()
     conn.close()
     return PLAYERS_NEEDED.get(row[0]) if row else None
+
+# ── replay parsing ────────────────────────────────────────────────────────────
+# Parses the Rocket League .replay binary header using the Unreal property format.
+# No external dependencies needed — everything is standard struct/bytes operations.
+
+def _rl_read_str(data: bytes, pos: int) -> tuple:
+    """Read a length-prefixed Unreal string. Returns (str, new_pos)."""
+    if pos + 4 > len(data):
+        raise ValueError("EOF at string length")
+    length = struct.unpack_from("<i", data, pos)[0]   # signed int32
+    pos += 4
+    if length == 0:
+        return "", pos
+    if length < 0:
+        # UTF-16LE — length is negative char count including null
+        byte_len = (-length) * 2
+        s = data[pos:pos + byte_len].decode("utf-16-le", errors="replace").rstrip("\x00")
+        return s, pos + byte_len
+    else:
+        # ASCII — length includes null terminator
+        s = data[pos:pos + length - 1].decode("latin-1", errors="replace")
+        return s, pos + length
+
+def _rl_read_prop(data: bytes, pos: int) -> tuple:
+    """
+    Read one Unreal serialised property.
+    Returns (name, value, new_pos).
+    name == 'None' signals end of property list.
+    """
+    name, pos = _rl_read_str(data, pos)
+    if not name or name == "None":
+        return "None", None, pos
+
+    type_name, pos = _rl_read_str(data, pos)
+
+    # 8-byte size block: [0-3] value_size  [4-7] array_index
+    if pos + 8 > len(data):
+        raise ValueError("EOF at property size block")
+    value_size = struct.unpack_from("<I", data, pos)[0]
+    pos += 8
+
+    if type_name == "IntProperty":
+        val = struct.unpack_from("<i", data, pos)[0]
+        return name, val, pos + 4
+
+    elif type_name in ("StrProperty", "NameProperty"):
+        val, pos = _rl_read_str(data, pos)
+        return name, val, pos
+
+    elif type_name == "QWordProperty":
+        val = struct.unpack_from("<Q", data, pos)[0]
+        return name, val, pos + 8
+
+    elif type_name == "BoolProperty":
+        val = bool(data[pos])
+        return name, val, pos + 1
+
+    elif type_name == "FloatProperty":
+        val = struct.unpack_from("<f", data, pos)[0]
+        return name, val, pos + 4
+
+    elif type_name == "ByteProperty":
+        # Named enum: enum_type string + value string; or raw byte if enum_type is "None"
+        enum_type, pos = _rl_read_str(data, pos)
+        if enum_type == "None":
+            return name, data[pos], pos + 1
+        val, pos = _rl_read_str(data, pos)
+        return name, val, pos
+
+    elif type_name == "ArrayProperty":
+        count = struct.unpack_from("<I", data, pos)[0]
+        pos += 4
+        items = []
+        for _ in range(count):
+            item = {}
+            while pos < len(data):
+                n, v, pos = _rl_read_prop(data, pos)
+                if n == "None":
+                    break
+                item[n] = v
+            items.append(item)
+        return name, items, pos
+
+    else:
+        # Unknown type — skip by the declared value_size
+        return name, None, pos + value_size
+
+
+def parse_replay_header(path: str) -> dict | None:
+    """
+    Parse a Rocket League .replay file header and return:
+    {
+        "score0": int | None,
+        "score1": int | None,
+        "date":   str | None,      # "YYYY-MM-DD HH:MM:SS" UTC, from replay metadata
+        "players": [
+            {"name": str, "online_id": int, "team": int}   # team 0=blue, 1=orange
+        ]
+    }
+    Returns None if the file cannot be parsed at all.
+    """
+    try:
+        with open(path, "rb") as f:
+            data = f.read(131072)   # 128 KB covers any RL replay header
+
+        if len(data) < 16:
+            return None
+
+        # File starts with: header_size(4) crc(4) major_version(4) minor_version(4)
+        major = struct.unpack_from("<I", data, 8)[0]
+        minor = struct.unpack_from("<I", data, 12)[0]
+
+        # Some builds have an extra net_version uint32 at offset 16
+        pos = 20 if (major >= 868 and minor >= 18) else 16
+
+        result: dict = {"score0": None, "score1": None, "date": None, "players": []}
+
+        while pos < len(data):
+            name, value, pos = _rl_read_prop(data, pos)
+            if name == "None":
+                break
+            if name == "Team0Score" and value is not None:
+                result["score0"] = int(value)
+            elif name == "Team1Score" and value is not None:
+                result["score1"] = int(value)
+            elif name == "Date" and isinstance(value, str):
+                result["date"] = value
+            elif name == "PlayerStats" and isinstance(value, list):
+                for entry in value:
+                    if not isinstance(entry, dict):
+                        continue
+                    result["players"].append({
+                        "name":      entry.get("Name", ""),
+                        "online_id": int(entry.get("OnlineID", 0)),
+                        "team":      int(entry.get("Team", -1)),
+                    })
+
+        return result
+
+    except Exception as exc:
+        print(f"[replay] parse error for {path}: {exc}")
+        return None
+
+
+def verify_replay(parsed: dict, m: dict) -> dict:
+    """
+    Cross-check a parsed replay against the expected match state.
+    Returns:
+        {"verdict": "verified",      "winner_ids": [...], "loser_ids": [...],
+                                     "score0": int, "score1": int}
+        {"verdict": "unverifiable",  "reason": str}   ← fall back to manual consensus
+        {"verdict": "conflict",      "reason": str}   ← flag for admin
+    """
+    score0 = parsed.get("score0")
+    score1 = parsed.get("score1")
+
+    # ── 1. Scores must be present and decisive ────────────────────────────────
+    if score0 is None or score1 is None:
+        return {"verdict": "unverifiable", "reason": "Scores not found in replay"}
+    if score0 == score1:
+        return {"verdict": "unverifiable", "reason": "Scores are level — cannot determine winner from replay"}
+
+    # ── 2. Date must be within 3 hours of lobby_ready_at ─────────────────────
+    date_str      = parsed.get("date")
+    lobby_ready_at = m.get("lobby_ready_at")
+    if date_str and lobby_ready_at:
+        try:
+            replay_dt = datetime.strptime(date_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+            diff = abs(replay_dt.timestamp() - lobby_ready_at)
+            if diff > 10800:   # 3 hours
+                return {
+                    "verdict": "conflict",
+                    "reason":  f"Replay date ({date_str} UTC) is more than 3 hours from match start",
+                }
+        except ValueError:
+            pass   # unparseable date — skip this check
+
+    # ── 3. All expected Steam players must appear in the replay ───────────────
+    replay_players = parsed.get("players", [])
+    replay_ids     = {p["online_id"] for p in replay_players if p["online_id"] > 0}
+
+    all_pids            = m.get("players", [])
+    expected_steam: dict = {}   # player_id -> steam_id (int)
+    for pid in all_pids:
+        rid = real_id_map.get(pid, "")
+        if rid and rid.isdigit() and int(rid) > 0:
+            expected_steam[pid] = int(rid)
+
+    if expected_steam:
+        missing = [pid for pid, sid in expected_steam.items() if sid not in replay_ids]
+        if missing:
+            return {
+                "verdict": "conflict",
+                "reason":  f"{len(missing)} registered player(s) not found in replay",
+            }
+
+    # ── 4. Each Steam player must be on their assigned team ───────────────────
+    if replay_players and expected_steam:
+        for rp in replay_players:
+            oid = rp.get("online_id", 0)
+            if oid == 0:
+                continue
+            # Find matching player_id
+            matched = next((pid for pid, sid in expected_steam.items() if sid == oid), None)
+            if matched is None:
+                continue
+            replay_team   = rp.get("team", -1)
+            expected_team = 0 if matched in m.get("team_a", []) else 1
+            if replay_team not in (0, 1):
+                continue
+            if replay_team != expected_team:
+                return {
+                    "verdict": "conflict",
+                    "reason":  "A player was on the wrong team in the replay (possible team-swap cheat)",
+                }
+
+    # ── All checks passed ─────────────────────────────────────────────────────
+    team_a = m.get("team_a", [])
+    team_b = m.get("team_b", [])
+    # team_a = Blue = Team0, team_b = Orange = Team1
+    if score0 > score1:
+        winner_ids, loser_ids = team_a, team_b
+    else:
+        winner_ids, loser_ids = team_b, team_a
+
+    return {
+        "verdict":    "verified",
+        "winner_ids": winner_ids,
+        "loser_ids":  loser_ids,
+        "score0":     score0,
+        "score1":     score1,
+    }
+
 
 # ── models ─────────────────────────────────────────────────────────────────────
 class JoinRequest(BaseModel):
@@ -882,6 +1117,77 @@ def match_lobby_ready(req: AcceptRequest):
     return {"status": "lobby_ready"}
 
 
+MAX_REPLAY_BYTES = 50 * 1024 * 1024   # 50 MB
+
+@app.post("/match/upload_replay/{match_id}")
+async def upload_replay_for_verification(match_id: str, request: Request,
+                                          player_id: str = ""):
+    """
+    Auto-uploaded by the plugin when a player presses Win/Loss/Draw.
+    Parses the replay to verify players, teams, timing, and score.
+
+    Outcomes:
+      auto_resolved  → replay verified, MMR awarded immediately (no admin needed)
+      unverifiable   → replay couldn't confirm result (e.g. Epic players, parse error)
+                       → falls back to Win/Loss/Draw button consensus
+      conflict       → replay contradicts expected state → flagged for admin
+      already_resolved → match was already resolved before this upload arrived
+    """
+    # If already resolved, nothing to do
+    m = matches.get(match_id)
+    if not m:
+        return {"status": "already_resolved"}
+
+    conn_chk = sqlite3.connect(DB_PATH)
+    already  = conn_chk.execute(
+        "SELECT 1 FROM match_history WHERE match_id=?", (match_id,)
+    ).fetchone()
+    conn_chk.close()
+    if already:
+        return {"status": "already_resolved"}
+
+    replay_bytes = await request.body()
+    if not replay_bytes or len(replay_bytes) < 4096:
+        return {"status": "unverifiable", "reason": "Replay too small or empty"}
+    if len(replay_bytes) > MAX_REPLAY_BYTES:
+        return {"status": "unverifiable", "reason": "Replay too large"}
+
+    # Save to disk
+    replay_dir  = os.path.join(os.path.dirname(__file__), "replays")
+    os.makedirs(replay_dir, exist_ok=True)
+    replay_path = os.path.join(replay_dir, f"{safe_filename(match_id)}.replay")
+    with open(replay_path, "wb") as f:
+        f.write(replay_bytes)
+
+    # Parse
+    parsed = parse_replay_header(replay_path)
+    if not parsed:
+        print(f"[replay] could not parse replay for {match_id}")
+        return {"status": "unverifiable", "reason": "Replay could not be parsed"}
+
+    # Verify
+    result = verify_replay(parsed, m)
+    print(f"[replay] {match_id} verdict={result['verdict']} "
+          f"reason={result.get('reason', result.get('score0'))}")
+
+    if result["verdict"] == "verified":
+        _award_match(match_id, m,
+                     result["winner_ids"], result["loser_ids"],
+                     outcome="replay_verified")
+        return {
+            "status":  "auto_resolved",
+            "score":   f"{result['score0']}-{result['score1']}",
+            "winners": result["winner_ids"],
+        }
+
+    elif result["verdict"] == "conflict":
+        _flag_disputed(match_id, m)
+        return {"status": "flagged", "reason": result["reason"]}
+
+    else:   # unverifiable — leave match active, let button consensus decide
+        return {"status": "unverifiable", "reason": result.get("reason", "")}
+
+
 @app.post("/match/result")
 def submit_match_result(req: MatchResultRequest):
     """
@@ -1251,7 +1557,6 @@ def admin_cancel_match(match_id: str, password: str = ""):
     return {"status": "cancelled", "note": note}
 
 # ── routes: dispute replay upload ─────────────────────────────────────────────
-MAX_REPLAY_BYTES = 50 * 1024 * 1024   # 50 MB
 
 @app.post("/match/report/{match_id}")
 async def report_match(match_id: str, request: Request, reporter: str = ""):

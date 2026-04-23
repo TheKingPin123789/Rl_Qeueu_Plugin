@@ -168,6 +168,7 @@ private:
 
     // ── result (manual) ───────────────────────────────────────────────────────
     void SubmitOutcome(const std::string& outcome);  // "win" / "loss" / "draw"
+    void UploadReplayForVerification();              // called automatically after SubmitOutcome
 
     // ── history ───────────────────────────────────────────────────────────────
     void FetchHistory();
