@@ -39,6 +39,9 @@
       <ModuleDefinitionFile>
       </ModuleDefinitionFile>
     </Link>
+    <PostBuildEvent>
+      <Command>copy /Y "$(OutDir)$(TargetName)$(TargetExt)" "$(APPDATA)\bakkesmod\bakkesmod\plugins\$(TargetName)$(TargetExt)"</Command>
+    </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="QueuePlugin.cpp" />
